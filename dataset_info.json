@@ -1,0 +1,9 @@
+{
+    "original_size": 9995,
+    "feature_count_tfidf": 5000,
+    "feature_count_bow": 5000,
+    "train_size": 7996,
+    "test_size": 1999,
+    "has_target": true,
+    "target_column": "rating"
+}
