@@ -101,7 +101,7 @@ with open('count_vectorizer.pkl', 'wb') as f:
 # Save datasets
 np.savez('tfidf_train_test_data.npz', 
             X_train=X_tfidf_train, X_test=X_tfidf_test, 
-            y_train=y_train, y_test=y_test, allow_pickle=True)
+            y_train=y_train, y_test=y_test)
 
 np.savez('bow_train_test_data.npz', 
             X_train=X_bow_train, X_test=X_bow_test, 
