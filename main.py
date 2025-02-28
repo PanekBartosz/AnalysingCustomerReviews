@@ -18,10 +18,10 @@ stop_words = set(stopwords.words('english'))
 lemmatizer = WordNetLemmatizer()
 
 # Path to the data
-file_path = "Musical_Instruments.jsonl"
+file_path = "data/Musical_Instruments.jsonl"
 
 # Function to load the jsonl file 
-def load_jsonl_in_batches(file_path, batch_size=10000):
+def load_jsonl_in_batches(file_path, batch_size=15000):
     data = []
     with open(file_path, 'r', encoding='utf-8') as f:
         batch_count = 0
@@ -39,7 +39,7 @@ reviews = load_jsonl_in_batches(file_path)
 print(f"Loaded {len(reviews)} reviews in {time.time() - start_time:.2f} seconds")
 
 # Sample size
-sample_size = 10000
+sample_size = 15000
 use_sample = True
 
 # Convert to DataFrame
@@ -114,8 +114,14 @@ for i in range(0, total_rows, batch_size):
 
 df = processed_df
 
-# Drop rows with empty tokenized text
-df = df.dropna(subset=['tokens'])
+# Create a binary sentiment label based on 'rating'
+# rating >= 4.0 -> 1 (positive), else -> 0 (negative)
+df['sentiment'] = df['rating'].apply(lambda x: 1 if x >= 4.0 else 0)
+
+# Drop rows with missing values and duplicates
+df.dropna(subset=['cleaned_text', 'sentiment','tokens'], inplace=True)
+df.drop_duplicates(subset=['cleaned_text'], inplace=True)
+
 print(f"After removing rows with empty tokens: {df.shape[0]} rows")
 
 # Examples of cleaned and tokenized reviews
@@ -123,7 +129,7 @@ print("\nExample of cleaned and tokenized reviews:")
 print(df[['cleaned_text', 'tokens']].head(3))
 
 # Save the cleaned and tokenized data
-output_file = 'cleaned_amazon_reviews.csv'
+output_file = 'data/cleaned_amazon_reviews.csv'
 print(f"Saving to {output_file}...")
 df.to_csv(output_file, index=False)
 
