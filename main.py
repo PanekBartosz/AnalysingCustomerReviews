@@ -13,7 +13,7 @@ from nltk.stem import WordNetLemmatizer
 from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.svm import SVC
 from sklearn.metrics import (accuracy_score, precision_score, classification_report, 
                            confusion_matrix, roc_curve, auc, precision_recall_curve, 
@@ -29,6 +29,7 @@ from transformers import BertTokenizer, BertForSequenceClassification, AdamW
 from tqdm import tqdm
 from datetime import datetime
 import psutil
+from sklearn.decomposition import TruncatedSVD
 
 # Initialize NLTK resources
 stop_words = set(stopwords.words('english'))
@@ -36,8 +37,9 @@ lemmatizer = WordNetLemmatizer()
 
 class TextDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_length=128):
-        self.texts = texts
-        self.labels = labels
+        # Konwersja do list dla bezpieczniejszego indeksowania
+        self.texts = texts.tolist() if hasattr(texts, 'tolist') else list(texts)
+        self.labels = labels.tolist() if hasattr(labels, 'tolist') else list(labels)
         self.tokenizer = tokenizer
         self.max_length = max_length
 
@@ -45,6 +47,9 @@ class TextDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
+        if idx >= len(self.texts):
+            raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self.texts)}")
+            
         text = str(self.texts[idx])
         label = self.labels[idx]
 
@@ -88,12 +93,36 @@ class CNN(nn.Module):
         ])
         self.fc = nn.Linear(len(filter_sizes) * n_filters, output_dim)
         self.dropout = nn.Dropout(dropout)
+        
+        # Inicjalizacja wag
+        for conv in self.convs:
+            nn.init.xavier_uniform_(conv.weight)
+            nn.init.constant_(conv.bias, 0)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.constant_(self.fc.bias, 0)
 
     def forward(self, text):
-        embedded = self.embedding(text)
-        embedded = embedded.unsqueeze(1)
-        conved = [nn.functional.relu(conv(embedded)).squeeze(3) for conv in self.convs]
-        pooled = [nn.functional.max_pool1d(conv, conv.shape[2]).squeeze(2) for conv in conved]
+        # text = [batch size, sent len]
+        embedded = self.embedding(text)  # [batch size, sent len, emb dim]
+        embedded = embedded.unsqueeze(1)  # [batch size, 1, sent len, emb dim]
+        
+        # Zastosuj konwolucje i aktywację
+        conved = []
+        for conv in self.convs:
+            # conv(embedded) = [batch size, n_filters, sent len - filter_size + 1, 1]
+            conv_out = conv(embedded)
+            conv_out = conv_out.squeeze(3)  # [batch size, n_filters, sent len - filter_size + 1]
+            conv_out = nn.functional.relu(conv_out)
+            conved.append(conv_out)
+            
+        # Pooling
+        pooled = []
+        for conv_out in conved:
+            # max_pool = [batch size, n_filters, 1]
+            pooled_out = nn.functional.max_pool1d(conv_out, conv_out.shape[2])
+            pooled_out = pooled_out.squeeze(2)  # [batch size, n_filters]
+            pooled.append(pooled_out)
+            
         cat = self.dropout(torch.cat(pooled, dim=1))
         return self.fc(cat)
 
@@ -304,10 +333,12 @@ def train_traditional_models(df, result_dir):
     X = df['cleaned_text']
     y = df['sentiment']
 
+    # Podział danych
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
+    # Wektoryzacja
     vectorizer = TfidfVectorizer(
         stop_words='english',
         ngram_range=(1, 2),
@@ -316,61 +347,53 @@ def train_traditional_models(df, result_dir):
     X_train_vect = vectorizer.fit_transform(X_train)
     X_test_vect = vectorizer.transform(X_test)
 
+    # Oversampling
     ros = RandomOverSampler(random_state=42)
     X_train_resampled, y_train_resampled = ros.fit_resample(X_train_vect, y_train)
 
-    models = {
-        'Naive_Bayes': MultinomialNB(),
-        'Logistic_Regression': LogisticRegression(max_iter=1000, class_weight='balanced'),
-        'SVM': SVC(kernel='linear', class_weight='balanced', probability=True)
-    }
+    # Tylko model SVM
+    model = SGDClassifier(
+        loss='hinge',  # Linear SVM
+        class_weight='balanced',
+        max_iter=1000,
+        n_jobs=-1,
+        random_state=42
+    )
 
-    results = {}
-    for name, model in models.items():
-        print(f"\nEvaluating {name}...")
-        model_metrics = {}
+    # Trenowanie
+    print("\nTrenowanie modelu SVM...")
+    model.fit(X_train_resampled, y_train_resampled)
 
-        # Measure training time and resources
-        @evaluator.measure_training_time
-        def train_model():
-            model.fit(X_train_resampled, y_train_resampled)
-        
-        _, training_metrics = train_model()
-        model_metrics.update(training_metrics)
+    # Predykcje
+    y_pred = model.predict(X_test_vect)
 
-        # Cross-validation
-        cv_results = evaluator.cross_validate(model, X_train_vect, y_train)
-        model_metrics.update(cv_results)
-
-        # Predictions and metrics
-        y_pred = model.predict(X_test_vect)
-        y_pred_proba = model.predict_proba(X_test_vect)[:, 1]
-
-        # Calculate metrics
-        model_metrics.update({
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred),
-            'roc_auc': evaluator.plot_roc_curve(y_test, y_pred_proba, name),
-            'avg_precision': evaluator.plot_precision_recall_curve(y_test, y_pred_proba, name)
-        })
-
-        # Save confusion matrix
-        save_confusion_matrix(confusion_matrix(y_test, y_pred), name, result_dir)
-
-        # Save model metrics
-        evaluator.save_metrics(name, model_metrics)
-        results[name] = model_metrics
-
-        # Save model
-        joblib.dump(model, os.path.join(result_dir, f'{name.lower()}_model.joblib'))
-
-    # Generate LaTeX comparison table
-    evaluator.generate_latex_table(results)
+    # Obliczanie metryk
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    conf_matrix = confusion_matrix(y_test, y_pred)
     
-    # Save vectorizer
+    print(f"\nWyniki klasyfikacji sentymentu:")
+    print(f"Dokładność (accuracy): {accuracy:.4f}")
+    print(f"Precyzja (precision): {precision:.4f}")
+    print("\nMacierz pomyłek:")
+    print(conf_matrix)
+
+    # Zapisywanie macierzy pomyłek
+    save_confusion_matrix(conf_matrix, "SVM", result_dir)
+
+    # Zapisywanie modelu
+    joblib.dump(model, os.path.join(result_dir, 'svm_model.joblib'))
     joblib.dump(vectorizer, os.path.join(result_dir, 'tfidf_vectorizer.joblib'))
-    
-    return results, vectorizer
+
+    return {
+        'model': model,
+        'vectorizer': vectorizer,
+        'metrics': {
+            'accuracy': accuracy,
+            'precision': precision,
+            'confusion_matrix': conf_matrix
+        }
+    }
 
 def train_bert(df, result_dir):
     evaluator = ModelEvaluator(result_dir)
@@ -381,12 +404,22 @@ def train_bert(df, result_dir):
     model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
     model.to(device)
 
-    # Prepare data
+    # Przygotowanie danych - dodaj reset_index()
     X_train, X_test, y_train, y_test = train_test_split(
-        df['cleaned_text'], df['sentiment'], test_size=0.2, random_state=42, stratify=df['sentiment']
+        df['cleaned_text'], 
+        df['sentiment'], 
+        test_size=0.2, 
+        random_state=42, 
+        stratify=df['sentiment']
     )
+    
+    # Reset indeksów po podziale
+    X_train = X_train.reset_index(drop=True)
+    X_test = X_test.reset_index(drop=True)
+    y_train = y_train.reset_index(drop=True)
+    y_test = y_test.reset_index(drop=True)
 
-    # Create datasets
+    # Tworzenie datasetów
     train_dataset = TextDataset(X_train, y_train, tokenizer)
     test_dataset = TextDataset(X_test, y_test, tokenizer)
     
@@ -591,119 +624,172 @@ def train_lstm(df, result_dir):
     return evaluation_metrics
 
 def train_cnn(df, result_dir):
-    evaluator = ModelEvaluator(result_dir)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nTraining CNN model on device: {device}")
-
-    # Data preparation
-    X_train, X_test, y_train, y_test = train_test_split(
-        df['tokens'], df['sentiment'], test_size=0.2, random_state=42, stratify=df['sentiment']
-    )
-
-    # Create vocabulary
-    vocab = set()
-    for tokens in df['tokens']:
-        vocab.update(tokens)
-    
-    word_to_idx = {word: idx + 1 for idx, word in enumerate(vocab)}
-    vocab_size = len(word_to_idx) + 1
-
-    # Convert tokens to indices
-    def tokens_to_indices(tokens, max_len=100):
-        indices = [word_to_idx.get(word, 0) for word in tokens[:max_len]]
-        if len(indices) < max_len:
-            indices += [0] * (max_len - len(indices))
-        return indices
-
-    X_train_indices = torch.LongTensor([tokens_to_indices(tokens) for tokens in X_train]).to(device)
-    X_test_indices = torch.LongTensor([tokens_to_indices(tokens) for tokens in X_test]).to(device)
-    y_train = torch.LongTensor(y_train.values).to(device)
-    y_test = torch.LongTensor(y_test.values).to(device)
-
-    # Model initialization
-    model = CNN(
-        vocab_size=vocab_size,
-        embedding_dim=100,
-        n_filters=100,
-        filter_sizes=[3, 4, 5],
-        output_dim=2,
-        dropout=0.5
-    ).to(device)
-
-    # Training setup
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters())
-    training_metrics = {
-        'epoch_times': [],
-        'epoch_losses': [],
-        'memory_usage': [],
-        'gpu_memory_usage': [] if torch.cuda.is_available() else None
-    }
-
-    # Training loop
-    n_epochs = 5
-    batch_size = 64
-
-    for epoch in range(n_epochs):
-        epoch_start = time.time()
-        model.train()
-        total_loss = 0
+    try:
+        evaluator = ModelEvaluator(result_dir)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"\nTraining CNN model on device: {device}")
         
-        for i in range(0, len(X_train_indices), batch_size):
-            batch_x = X_train_indices[i:i+batch_size]
-            batch_y = y_train[i:i+batch_size]
-            
-            optimizer.zero_grad()
-            predictions = model(batch_x)
-            loss = criterion(predictions, batch_y)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-
-        # Record metrics
-        epoch_time = time.time() - epoch_start
-        training_metrics['epoch_times'].append(epoch_time)
-        training_metrics['epoch_losses'].append(total_loss/len(X_train_indices))
-        training_metrics['memory_usage'].append(
-            psutil.Process().memory_info().rss / 1024 / 1024
-        )
-        
+        torch.manual_seed(42)
         if torch.cuda.is_available():
-            training_metrics['gpu_memory_usage'].append(
-                torch.cuda.memory_allocated() / 1024 / 1024
-            )
+            torch.cuda.manual_seed_all(42)
+
+        # Data preparation
+        X_train, X_test, y_train, y_test = train_test_split(
+            df['tokens'], df['sentiment'], test_size=0.2, random_state=42, stratify=df['sentiment']
+        )
+
+        # Create vocabulary
+        vocab = set()
+        for tokens in df['tokens']:
+            vocab.update(tokens)
         
-        print(f'Epoch: {epoch+1}, Loss: {total_loss/len(X_train_indices):.4f}')
+        word_to_idx = {word: idx + 1 for idx, word in enumerate(vocab)}
+        vocab_size = len(word_to_idx) + 1
 
-    # Evaluation
-    model.eval()
-    with torch.no_grad():
-        test_predictions = model(X_test_indices)
-        proba = torch.softmax(test_predictions, dim=1)
-        predictions = proba.argmax(dim=1).cpu().numpy()
-        proba_predictions = proba[:, 1].cpu().numpy()
-        actual_labels = y_test.cpu().numpy()
+        def tokens_to_indices(tokens, max_len=100):
+            indices = [word_to_idx.get(word, 0) for word in tokens[:max_len]]
+            if len(indices) < max_len:
+                indices += [0] * (max_len - len(indices))
+            return indices
 
-    # Calculate metrics
-    evaluation_metrics = {
-        'accuracy': accuracy_score(actual_labels, predictions),
-        'precision': precision_score(actual_labels, predictions),
-        'roc_auc': evaluator.plot_roc_curve(actual_labels, proba_predictions, "CNN"),
-        'avg_precision': evaluator.plot_precision_recall_curve(actual_labels, proba_predictions, "CNN"),
-        'training_metrics': training_metrics
-    }
+        print("Converting tokens to indices...")
+        X_train_indices = torch.LongTensor([tokens_to_indices(tokens) for tokens in X_train]).to(device)
+        X_test_indices = torch.LongTensor([tokens_to_indices(tokens) for tokens in X_test]).to(device)
+        y_train = torch.LongTensor(y_train.values).to(device)
+        y_test = torch.LongTensor(y_test.values).to(device)
 
-    # Save results
-    save_confusion_matrix(confusion_matrix(actual_labels, predictions), "CNN", result_dir)
-    evaluator.save_metrics("CNN", evaluation_metrics)
-    torch.save(model.state_dict(), os.path.join(result_dir, 'cnn_model.pt'))
-    joblib.dump(word_to_idx, os.path.join(result_dir, 'cnn_vocabulary.joblib'))
+        # Model initialization
+        model = CNN(
+            vocab_size=vocab_size,
+            embedding_dim=100,
+            n_filters=100,
+            filter_sizes=[2, 3, 4],  # Reduced filter sizes
+            output_dim=2,
+            dropout=0.3  # Reduced dropout
+        ).to(device)
 
-    # Plot training curves
-    plot_training_curves(training_metrics, "CNN", result_dir)
+        # Training configuration
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # Added weight decay
+        training_metrics = {
+            'epoch_times': [],
+            'epoch_losses': [],
+            'memory_usage': [],
+            'gpu_memory_usage': [] if torch.cuda.is_available() else None
+        }
 
-    return evaluation_metrics
+        # Training parameters
+        n_epochs = 5
+        batch_size = 32  # Reduced batch size
+        grad_clip = 1.0  # Gradient clipping
+
+        print("\nStarting training...")
+        for epoch in range(n_epochs):
+            epoch_start = time.time()
+            model.train()
+            total_loss = 0
+            batch_count = 0
+            
+            # Shuffle data
+            indices = torch.randperm(len(X_train_indices))
+            X_train_indices = X_train_indices[indices]
+            y_train = y_train[indices]
+            
+            for i in range(0, len(X_train_indices), batch_size):
+                batch_x = X_train_indices[i:i+batch_size]
+                batch_y = y_train[i:i+batch_size]
+                
+                optimizer.zero_grad()
+                
+                try:
+                    predictions = model(batch_x)
+                    loss = criterion(predictions, batch_y)
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                    batch_count += 1
+                    
+                    if batch_count % 50 == 0:
+                        print(f'Epoch: {epoch+1}, Batch: {batch_count}, Loss: {loss.item():.4f}')
+                        
+                except RuntimeError as e:
+                    print(f"Error during batch training: {e}")
+                    continue
+
+            # Save metrics
+            avg_loss = total_loss / batch_count
+            epoch_time = time.time() - epoch_start
+            training_metrics['epoch_times'].append(epoch_time)
+            training_metrics['epoch_losses'].append(avg_loss)
+            training_metrics['memory_usage'].append(
+                psutil.Process().memory_info().rss / 1024 / 1024
+            )
+            
+            if torch.cuda.is_available():
+                training_metrics['gpu_memory_usage'].append(
+                    torch.cuda.memory_allocated() / 1024 / 1024
+                )
+            
+            print(f'Epoch: {epoch+1}, Average Loss: {avg_loss:.4f}, Time: {epoch_time:.2f}s')
+            
+            # Clear CUDA memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Evaluation
+        print("\nStarting evaluation...")
+        model.eval()
+        predictions = []
+        actual_labels = []
+        proba_predictions = []
+        
+        with torch.no_grad():
+            for i in range(0, len(X_test_indices), batch_size):
+                batch_x = X_test_indices[i:i+batch_size]
+                batch_y = y_test[i:i+batch_size]
+                
+                outputs = model(batch_x)
+                proba = torch.softmax(outputs, dim=1)
+                predictions.extend(proba.argmax(dim=1).cpu().numpy())
+                proba_predictions.extend(proba[:, 1].cpu().numpy())
+                actual_labels.extend(batch_y.cpu().numpy())
+
+        # Calculate metrics
+        evaluation_metrics = {
+            'accuracy': accuracy_score(actual_labels, predictions),
+            'precision': precision_score(actual_labels, predictions),
+            'roc_auc': evaluator.plot_roc_curve(actual_labels, proba_predictions, "CNN"),
+            'avg_precision': evaluator.plot_precision_recall_curve(actual_labels, proba_predictions, "CNN"),
+            'training_metrics': training_metrics
+        }
+
+        # Save results
+        save_confusion_matrix(confusion_matrix(actual_labels, predictions), "CNN", result_dir)
+        evaluator.save_metrics("CNN", evaluation_metrics)
+        torch.save(model.state_dict(), os.path.join(result_dir, 'cnn_model.pt'))
+        joblib.dump(word_to_idx, os.path.join(result_dir, 'cnn_vocabulary.joblib'))
+
+        # Plot training curves
+        plot_training_curves(training_metrics, "CNN", result_dir)
+
+        print("\nCNN Model Results:")
+        print(f"Accuracy: {evaluation_metrics['accuracy']:.4f}")
+        print(f"Precision: {evaluation_metrics['precision']:.4f}")
+        print(f"ROC AUC: {evaluation_metrics['roc_auc']:.4f}")
+        
+        return evaluation_metrics
+        
+    except Exception as e:
+        print(f"\nAn error occurred during CNN model training: {str(e)}")
+        print("Error details:")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def main():
     start_time = time.time()
@@ -716,33 +802,27 @@ def main():
     file_path = "data/Musical_Instruments.jsonl"
     df = load_or_process_data(file_path)
     
-    # Train and evaluate all models
-    print("\nTraining and evaluating traditional models...")
-    traditional_results, vectorizer = train_traditional_models(df, 'result/evaluation')
+    # Commented out training of other models
+    # print("\n1. Training SVM model...")
+    # svm_results = train_traditional_models(df, 'result/evaluation')
     
-    print("\nTraining and evaluating BERT model...")
-    bert_results = train_bert(df, 'result/evaluation')
+    # print("\n2. Training BERT model...")
+    # bert_results = train_bert(df, 'result/evaluation')
     
-    print("\nTraining and evaluating LSTM model...")
-    lstm_results = train_lstm(df, 'result/evaluation')
+    # print("\n3. Training LSTM model...")
+    # lstm_results = train_lstm(df, 'result/evaluation')
     
-    print("\nTraining and evaluating CNN model...")
+    print("\n4. Training CNN model...")
     cnn_results = train_cnn(df, 'result/evaluation')
     
-    # Combine all results
-    all_results = {
-        **traditional_results,
-        'BERT': bert_results,
-        'LSTM': lstm_results,
-        'CNN': cnn_results
-    }
+    if cnn_results is not None:
+        print("\nCNN model training completed successfully.")
+        print("Model and results have been saved in 'result/evaluation' directory.")
+    else:
+        print("\nCNN model training failed.")
     
-    # Generate final comparison table
-    evaluator = ModelEvaluator('result/evaluation')
-    evaluator.generate_latex_table(all_results)
-    
-    execution_time = time.time() - start_time
-    print(f"\nTotal execution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
+    total_time = time.time() - start_time
+    print(f"\nExecution time: {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
     main()
