@@ -791,6 +791,107 @@ def train_cnn(df, result_dir):
         traceback.print_exc()
         return None
 
+def collect_and_compare_results(result_dir):
+    """
+    Collect results from all trained models and generate comparison tables and plots.
+    """
+    print("\nCollecting results from all models...")
+    
+    # Initialize results dictionary
+    all_results = {}
+    
+    # Load results for each model
+    model_names = ['SVM', 'Naive_Bayes', 'Logistic_Regression', 'BERT', 'LSTM', 'CNN']
+    
+    for model_name in model_names:
+        metrics_file = Path(result_dir) / f'metrics_{model_name}_*.json'
+        try:
+            # Get the most recent metrics file for each model
+            files = list(Path(result_dir).glob(f'metrics_{model_name}_*.json'))
+            if files:
+                latest_file = max(files, key=lambda x: x.stat().st_mtime)
+                with open(latest_file, 'r') as f:
+                    metrics = json.load(f)
+                
+                # Extract all available metrics
+                model_metrics = {}
+                
+                # Training time metrics
+                if 'training_metrics' in metrics:
+                    training_metrics = metrics['training_metrics']
+                    model_metrics['training_time'] = sum(training_metrics.get('epoch_times', [0]))
+                    model_metrics['cpu_usage'] = training_metrics.get('cpu_usage', 0)
+                    model_metrics['memory_usage'] = max(training_metrics.get('memory_usage', [0]))
+                
+                # Cross-validation metrics
+                if 'mean_accuracy' in metrics:
+                    model_metrics['mean_accuracy'] = metrics['mean_accuracy']
+                    model_metrics['std_accuracy'] = metrics['std_accuracy']
+                    model_metrics['cv_scores'] = metrics['cv_scores']
+                
+                # Performance metrics
+                model_metrics['accuracy'] = metrics.get('accuracy', None)
+                model_metrics['precision'] = metrics.get('precision', None)
+                model_metrics['roc_auc'] = metrics.get('roc_auc', None)
+                model_metrics['avg_precision'] = metrics.get('avg_precision', None)
+                
+                all_results[model_name] = model_metrics
+                
+        except Exception as e:
+            print(f"Could not load results for {model_name}: {str(e)}")
+    
+    # Create comparison table
+    metrics_df = pd.DataFrame.from_dict(all_results, orient='columns')
+    metrics_df = metrics_df.round(6)
+    
+    # Save tables
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save as CSV
+    metrics_df.to_csv(Path(result_dir) / f'model_comparison_full_{timestamp}.csv')
+    
+    # Generate LaTeX table
+    metrics_latex = metrics_df.to_latex()
+    with open(Path(result_dir) / f'model_comparison_full_{timestamp}.tex', 'w') as f:
+        f.write(metrics_latex)
+    
+    # Print results
+    print("\nFull Model Comparison:")
+    print(metrics_df)
+    
+    # Create comparison plots
+    plt.figure(figsize=(15, 5))
+    
+    # Accuracy comparison
+    plt.subplot(1, 3, 1)
+    accuracies = [all_results[model].get('accuracy', 0) for model in model_names if model in all_results]
+    plt.bar(range(len(accuracies)), accuracies)
+    plt.xticks(range(len(accuracies)), [model for model in model_names if model in all_results], rotation=45)
+    plt.title('Model Accuracy Comparison')
+    plt.ylabel('Accuracy')
+    
+    # ROC AUC comparison
+    plt.subplot(1, 3, 2)
+    roc_aucs = [all_results[model].get('roc_auc', 0) for model in model_names if model in all_results]
+    plt.bar(range(len(roc_aucs)), roc_aucs)
+    plt.xticks(range(len(roc_aucs)), [model for model in model_names if model in all_results], rotation=45)
+    plt.title('ROC AUC Comparison')
+    plt.ylabel('ROC AUC')
+    
+    # Training time comparison
+    plt.subplot(1, 3, 3)
+    times = [all_results[model].get('training_time', 0) for model in model_names if model in all_results]
+    plt.bar(range(len(times)), times)
+    plt.xticks(range(len(times)), [model for model in model_names if model in all_results], rotation=45)
+    plt.title('Training Time Comparison')
+    plt.ylabel('Time (seconds)')
+    
+    plt.tight_layout()
+    plt.savefig(Path(result_dir) / f'model_comparison_plots_{timestamp}.png')
+    plt.close()
+    
+    return all_results
+
 def main():
     start_time = time.time()
     
@@ -798,31 +899,12 @@ def main():
     os.makedirs('data', exist_ok=True)
     os.makedirs('result/evaluation', exist_ok=True)
     
-    # Load or process data
-    file_path = "data/Musical_Instruments.jsonl"
-    df = load_or_process_data(file_path)
-    
-    # Commented out training of other models
-    # print("\n1. Training SVM model...")
-    # svm_results = train_traditional_models(df, 'result/evaluation')
-    
-    # print("\n2. Training BERT model...")
-    # bert_results = train_bert(df, 'result/evaluation')
-    
-    # print("\n3. Training LSTM model...")
-    # lstm_results = train_lstm(df, 'result/evaluation')
-    
-    print("\n4. Training CNN model...")
-    cnn_results = train_cnn(df, 'result/evaluation')
-    
-    if cnn_results is not None:
-        print("\nCNN model training completed successfully.")
-        print("Model and results have been saved in 'result/evaluation' directory.")
-    else:
-        print("\nCNN model training failed.")
+    # Generate comparison of all models
+    print("\nGenerating comparison of all models...")
+    comparison_results = collect_and_compare_results('result/evaluation')
     
     total_time = time.time() - start_time
-    print(f"\nExecution time: {total_time:.2f} seconds.")
+    print(f"\nTotal execution time: {total_time:.2f} seconds.")
 
 if __name__ == "__main__":
     main()
