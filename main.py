@@ -10,12 +10,14 @@ from pathlib import Path
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
-from sklearn.metrics import accuracy_score, precision_score, classification_report, confusion_matrix
+from sklearn.metrics import (accuracy_score, precision_score, classification_report, 
+                           confusion_matrix, roc_curve, auc, precision_recall_curve, 
+                           average_precision_score)
 import matplotlib.pyplot as plt
 import seaborn as sns
 from imblearn.over_sampling import RandomOverSampler
@@ -25,6 +27,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertForSequenceClassification, AdamW
 from tqdm import tqdm
+from datetime import datetime
+import psutil
 
 # Initialize NLTK resources
 stop_words = set(stopwords.words('english'))
@@ -92,6 +96,116 @@ class CNN(nn.Module):
         pooled = [nn.functional.max_pool1d(conv, conv.shape[2]).squeeze(2) for conv in conved]
         cat = self.dropout(torch.cat(pooled, dim=1))
         return self.fc(cat)
+
+class ModelEvaluator:
+    def __init__(self, result_dir='result/evaluation'):
+        self.result_dir = Path(result_dir)
+        self.result_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics = {}
+        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    def measure_training_time(self, func):
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            start_cpu = psutil.Process().cpu_percent()
+            start_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+
+            result = func(*args, **kwargs)
+
+            end_time = time.time()
+            end_cpu = psutil.Process().cpu_percent()
+            end_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+
+            metrics = {
+                'training_time': end_time - start_time,
+                'cpu_usage': end_cpu - start_cpu,
+                'memory_usage': end_memory - start_memory
+            }
+
+            self.metrics[func.__name__] = metrics
+            return result, metrics
+        return wrapper
+
+    def cross_validate(self, model, X, y, cv=5):
+        cv_scores = cross_val_score(model, X, y, cv=cv, scoring='accuracy')
+        return {
+            'mean_accuracy': cv_scores.mean(),
+            'std_accuracy': cv_scores.std(),
+            'cv_scores': cv_scores.tolist()
+        }
+
+    def plot_roc_curve(self, y_true, y_pred_proba, model_name):
+        fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure()
+        plt.plot(fpr, tpr, color='darkorange', lw=2,
+                label=f'ROC curve (AUC = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curve - {model_name}')
+        plt.legend(loc="lower right")
+        
+        plt.savefig(self.result_dir / f'roc_curve_{model_name}_{self.timestamp}.png')
+        plt.close()
+        
+        return roc_auc
+
+    def plot_precision_recall_curve(self, y_true, y_pred_proba, model_name):
+        precision, recall, _ = precision_recall_curve(y_true, y_pred_proba)
+        avg_precision = average_precision_score(y_true, y_pred_proba)
+
+        plt.figure()
+        plt.plot(recall, precision, color='blue', lw=2,
+                label=f'Precision-Recall curve (AP = {avg_precision:.2f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title(f'Precision-Recall Curve - {model_name}')
+        plt.legend(loc="lower left")
+        
+        plt.savefig(self.result_dir / f'pr_curve_{model_name}_{self.timestamp}.png')
+        plt.close()
+        
+        return avg_precision
+
+    def save_metrics(self, model_name, metrics):
+        metrics_file = self.result_dir / f'metrics_{model_name}_{self.timestamp}.json'
+        with open(metrics_file, 'w') as f:
+            json.dump(metrics, f, indent=4)
+
+    def generate_latex_table(self, metrics_dict):
+        df = pd.DataFrame(metrics_dict).round(4)
+        latex_table = df.to_latex()
+        
+        with open(self.result_dir / f'comparison_table_{self.timestamp}.tex', 'w') as f:
+            f.write(latex_table)
+        
+        return latex_table
+
+def plot_training_curves(metrics, model_name, result_dir):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Loss curve
+    ax1.plot(metrics['epoch_losses'])
+    ax1.set_title(f'{model_name} Training Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    
+    # Memory usage
+    ax2.plot(metrics['memory_usage'], label='RAM')
+    if metrics.get('gpu_memory_usage'):
+        ax2.plot(metrics['gpu_memory_usage'], label='GPU')
+    ax2.set_title(f'{model_name} Memory Usage')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Memory (MB)')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(Path(result_dir) / f'training_curves_{model_name}.png')
+    plt.close()
 
 def load_or_process_data(file_path, force_reprocess=False):
     processed_data_path = Path('data/processed_data.pkl')
@@ -186,6 +300,7 @@ def process_data(file_path, sample_size=15000, use_sample=True):
     return processed_df
 
 def train_traditional_models(df, result_dir):
+    evaluator = ModelEvaluator(result_dir)
     X = df['cleaned_text']
     y = df['sentiment']
 
@@ -205,48 +320,95 @@ def train_traditional_models(df, result_dir):
     X_train_resampled, y_train_resampled = ros.fit_resample(X_train_vect, y_train)
 
     models = {
-        'Naive Bayes': MultinomialNB(),
-        'Logistic Regression': LogisticRegression(max_iter=1000, class_weight='balanced'),
-        'SVM': SVC(kernel='linear', class_weight='balanced')
+        'Naive_Bayes': MultinomialNB(),
+        'Logistic_Regression': LogisticRegression(max_iter=1000, class_weight='balanced'),
+        'SVM': SVC(kernel='linear', class_weight='balanced', probability=True)
     }
 
+    results = {}
     for name, model in models.items():
-        print(f"\nTraining model: {name}")
-        model.fit(X_train_resampled, y_train_resampled)
-        y_pred = model.predict(X_test_vect)
-        
-        print(f"\n=== {name} ===")
-        print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
-        print(f"Precision: {precision_score(y_test, y_pred, average='binary', zero_division=0):.4f}")
-        print("Classification Report:")
-        print(classification_report(y_test, y_pred, zero_division=0))
-        
-        save_confusion_matrix(confusion_matrix(y_test, y_pred), name, result_dir)
-        joblib.dump(model, os.path.join(result_dir, f'{name.lower().replace(" ", "_")}_model.joblib'))
+        print(f"\nEvaluating {name}...")
+        model_metrics = {}
 
+        # Measure training time and resources
+        @evaluator.measure_training_time
+        def train_model():
+            model.fit(X_train_resampled, y_train_resampled)
+        
+        _, training_metrics = train_model()
+        model_metrics.update(training_metrics)
+
+        # Cross-validation
+        cv_results = evaluator.cross_validate(model, X_train_vect, y_train)
+        model_metrics.update(cv_results)
+
+        # Predictions and metrics
+        y_pred = model.predict(X_test_vect)
+        y_pred_proba = model.predict_proba(X_test_vect)[:, 1]
+
+        # Calculate metrics
+        model_metrics.update({
+            'accuracy': accuracy_score(y_test, y_pred),
+            'precision': precision_score(y_test, y_pred),
+            'roc_auc': evaluator.plot_roc_curve(y_test, y_pred_proba, name),
+            'avg_precision': evaluator.plot_precision_recall_curve(y_test, y_pred_proba, name)
+        })
+
+        # Save confusion matrix
+        save_confusion_matrix(confusion_matrix(y_test, y_pred), name, result_dir)
+
+        # Save model metrics
+        evaluator.save_metrics(name, model_metrics)
+        results[name] = model_metrics
+
+        # Save model
+        joblib.dump(model, os.path.join(result_dir, f'{name.lower()}_model.joblib'))
+
+    # Generate LaTeX comparison table
+    evaluator.generate_latex_table(results)
+    
+    # Save vectorizer
     joblib.dump(vectorizer, os.path.join(result_dir, 'tfidf_vectorizer.joblib'))
-    return X_train, X_test, y_train, y_test
+    
+    return results, vectorizer
 
 def train_bert(df, result_dir):
+    evaluator = ModelEvaluator(result_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Initialize model and tokenizer
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
     model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
     model.to(device)
 
+    # Prepare data
     X_train, X_test, y_train, y_test = train_test_split(
         df['cleaned_text'], df['sentiment'], test_size=0.2, random_state=42, stratify=df['sentiment']
     )
 
+    # Create datasets
     train_dataset = TextDataset(X_train, y_train, tokenizer)
     test_dataset = TextDataset(X_test, y_test, tokenizer)
     
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=16)
 
+    # Training setup
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    
-    for epoch in range(3):
+    training_metrics = {
+        'epoch_times': [],
+        'epoch_losses': [],
+        'memory_usage': [],
+        'gpu_memory_usage': [] if torch.cuda.is_available() else None
+    }
+
+    # Training loop
+    n_epochs = 3
+    for epoch in range(n_epochs):
+        epoch_start = time.time()
         model.train()
+        total_loss = 0
+        
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}"):
             optimizer.zero_grad()
             input_ids = batch['input_ids'].to(device)
@@ -257,10 +419,27 @@ def train_bert(df, result_dir):
             loss = outputs.loss
             loss.backward()
             optimizer.step()
+            
+            total_loss += loss.item()
 
+        # Record metrics
+        epoch_time = time.time() - epoch_start
+        training_metrics['epoch_times'].append(epoch_time)
+        training_metrics['epoch_losses'].append(total_loss / len(train_loader))
+        training_metrics['memory_usage'].append(
+            psutil.Process().memory_info().rss / 1024 / 1024
+        )
+        
+        if torch.cuda.is_available():
+            training_metrics['gpu_memory_usage'].append(
+                torch.cuda.memory_allocated() / 1024 / 1024
+            )
+
+    # Evaluation
     model.eval()
     predictions = []
     actual_labels = []
+    proba_predictions = []
     
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
@@ -269,20 +448,35 @@ def train_bert(df, result_dir):
             labels = batch['labels']
             
             outputs = model(input_ids, attention_mask=attention_mask)
-            predictions.extend(outputs.logits.argmax(dim=1).cpu().numpy())
+            proba = torch.softmax(outputs.logits, dim=1)
+            predictions.extend(proba.argmax(dim=1).cpu().numpy())
+            proba_predictions.extend(proba[:, 1].cpu().numpy())
             actual_labels.extend(labels.numpy())
 
-    print("\n=== BERT ===")
-    print(f"Accuracy: {accuracy_score(actual_labels, predictions):.4f}")
-    print(f"Precision: {precision_score(actual_labels, predictions, average='binary', zero_division=0):.4f}")
-    print("Classification Report:")
-    print(classification_report(actual_labels, predictions, zero_division=0))
-    
+    # Calculate metrics
+    evaluation_metrics = {
+        'accuracy': accuracy_score(actual_labels, predictions),
+        'precision': precision_score(actual_labels, predictions),
+        'roc_auc': evaluator.plot_roc_curve(actual_labels, proba_predictions, "BERT"),
+        'avg_precision': evaluator.plot_precision_recall_curve(actual_labels, proba_predictions, "BERT"),
+        'training_metrics': training_metrics
+    }
+
+    # Save confusion matrix
     save_confusion_matrix(confusion_matrix(actual_labels, predictions), "BERT", result_dir)
+
+    # Save metrics and model
+    evaluator.save_metrics("BERT", evaluation_metrics)
     model.save_pretrained(os.path.join(result_dir, 'bert_model'))
     tokenizer.save_pretrained(os.path.join(result_dir, 'bert_tokenizer'))
 
+    # Plot training curves
+    plot_training_curves(training_metrics, "BERT", result_dir)
+
+    return evaluation_metrics
+
 def train_lstm(df, result_dir):
+    evaluator = ModelEvaluator(result_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nTraining LSTM model on device: {device}")
 
@@ -296,7 +490,7 @@ def train_lstm(df, result_dir):
     for tokens in df['tokens']:
         vocab.update(tokens)
     
-    word_to_idx = {word: idx + 1 for idx, word in enumerate(vocab)}  # 0 reserved for padding
+    word_to_idx = {word: idx + 1 for idx, word in enumerate(vocab)}
     vocab_size = len(word_to_idx) + 1
 
     # Convert tokens to indices
@@ -321,14 +515,22 @@ def train_lstm(df, result_dir):
         dropout=0.5
     ).to(device)
 
-    # Training parameters
+    # Training setup
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters())
+    training_metrics = {
+        'epoch_times': [],
+        'epoch_losses': [],
+        'memory_usage': [],
+        'gpu_memory_usage': [] if torch.cuda.is_available() else None
+    }
+
+    # Training loop
     n_epochs = 5
     batch_size = 64
 
-    # Training loop
     for epoch in range(n_epochs):
+        epoch_start = time.time()
         model.train()
         total_loss = 0
         
@@ -343,6 +545,19 @@ def train_lstm(df, result_dir):
             optimizer.step()
             
             total_loss += loss.item()
+
+        # Record metrics
+        epoch_time = time.time() - epoch_start
+        training_metrics['epoch_times'].append(epoch_time)
+        training_metrics['epoch_losses'].append(total_loss/len(X_train_indices))
+        training_metrics['memory_usage'].append(
+            psutil.Process().memory_info().rss / 1024 / 1024
+        )
+        
+        if torch.cuda.is_available():
+            training_metrics['gpu_memory_usage'].append(
+                torch.cuda.memory_allocated() / 1024 / 1024
+            )
         
         print(f'Epoch: {epoch+1}, Loss: {total_loss/len(X_train_indices):.4f}')
 
@@ -350,20 +565,33 @@ def train_lstm(df, result_dir):
     model.eval()
     with torch.no_grad():
         test_predictions = model(X_test_indices)
-        predictions = test_predictions.argmax(dim=1).cpu().numpy()
+        proba = torch.softmax(test_predictions, dim=1)
+        predictions = proba.argmax(dim=1).cpu().numpy()
+        proba_predictions = proba[:, 1].cpu().numpy()
         actual_labels = y_test.cpu().numpy()
 
-    print("\n=== LSTM ===")
-    print(f"Accuracy: {accuracy_score(actual_labels, predictions):.4f}")
-    print(f"Precision: {precision_score(actual_labels, predictions, average='binary', zero_division=0):.4f}")
-    print("Classification Report:")
-    print(classification_report(actual_labels, predictions, zero_division=0))
-    
+    # Calculate metrics
+    evaluation_metrics = {
+        'accuracy': accuracy_score(actual_labels, predictions),
+        'precision': precision_score(actual_labels, predictions),
+        'roc_auc': evaluator.plot_roc_curve(actual_labels, proba_predictions, "LSTM"),
+        'avg_precision': evaluator.plot_precision_recall_curve(actual_labels, proba_predictions, "LSTM"),
+        'training_metrics': training_metrics
+    }
+
+    # Save results
     save_confusion_matrix(confusion_matrix(actual_labels, predictions), "LSTM", result_dir)
+    evaluator.save_metrics("LSTM", evaluation_metrics)
     torch.save(model.state_dict(), os.path.join(result_dir, 'lstm_model.pt'))
     joblib.dump(word_to_idx, os.path.join(result_dir, 'lstm_vocabulary.joblib'))
 
+    # Plot training curves
+    plot_training_curves(training_metrics, "LSTM", result_dir)
+
+    return evaluation_metrics
+
 def train_cnn(df, result_dir):
+    evaluator = ModelEvaluator(result_dir)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nTraining CNN model on device: {device}")
 
@@ -402,14 +630,22 @@ def train_cnn(df, result_dir):
         dropout=0.5
     ).to(device)
 
-    # Training parameters
+    # Training setup
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters())
+    training_metrics = {
+        'epoch_times': [],
+        'epoch_losses': [],
+        'memory_usage': [],
+        'gpu_memory_usage': [] if torch.cuda.is_available() else None
+    }
+
+    # Training loop
     n_epochs = 5
     batch_size = 64
 
-    # Training loop
     for epoch in range(n_epochs):
+        epoch_start = time.time()
         model.train()
         total_loss = 0
         
@@ -424,6 +660,19 @@ def train_cnn(df, result_dir):
             optimizer.step()
             
             total_loss += loss.item()
+
+        # Record metrics
+        epoch_time = time.time() - epoch_start
+        training_metrics['epoch_times'].append(epoch_time)
+        training_metrics['epoch_losses'].append(total_loss/len(X_train_indices))
+        training_metrics['memory_usage'].append(
+            psutil.Process().memory_info().rss / 1024 / 1024
+        )
+        
+        if torch.cuda.is_available():
+            training_metrics['gpu_memory_usage'].append(
+                torch.cuda.memory_allocated() / 1024 / 1024
+            )
         
         print(f'Epoch: {epoch+1}, Loss: {total_loss/len(X_train_indices):.4f}')
 
@@ -431,42 +680,66 @@ def train_cnn(df, result_dir):
     model.eval()
     with torch.no_grad():
         test_predictions = model(X_test_indices)
-        predictions = test_predictions.argmax(dim=1).cpu().numpy()
+        proba = torch.softmax(test_predictions, dim=1)
+        predictions = proba.argmax(dim=1).cpu().numpy()
+        proba_predictions = proba[:, 1].cpu().numpy()
         actual_labels = y_test.cpu().numpy()
 
-    print("\n=== CNN ===")
-    print(f"Accuracy: {accuracy_score(actual_labels, predictions):.4f}")
-    print(f"Precision: {precision_score(actual_labels, predictions, average='binary', zero_division=0):.4f}")
-    print("Classification Report:")
-    print(classification_report(actual_labels, predictions, zero_division=0))
-    
+    # Calculate metrics
+    evaluation_metrics = {
+        'accuracy': accuracy_score(actual_labels, predictions),
+        'precision': precision_score(actual_labels, predictions),
+        'roc_auc': evaluator.plot_roc_curve(actual_labels, proba_predictions, "CNN"),
+        'avg_precision': evaluator.plot_precision_recall_curve(actual_labels, proba_predictions, "CNN"),
+        'training_metrics': training_metrics
+    }
+
+    # Save results
     save_confusion_matrix(confusion_matrix(actual_labels, predictions), "CNN", result_dir)
+    evaluator.save_metrics("CNN", evaluation_metrics)
     torch.save(model.state_dict(), os.path.join(result_dir, 'cnn_model.pt'))
     joblib.dump(word_to_idx, os.path.join(result_dir, 'cnn_vocabulary.joblib'))
+
+    # Plot training curves
+    plot_training_curves(training_metrics, "CNN", result_dir)
+
+    return evaluation_metrics
 
 def main():
     start_time = time.time()
     
-    # Create directories if they don't exist
+    # Create directories
     os.makedirs('data', exist_ok=True)
-    os.makedirs('result', exist_ok=True)
+    os.makedirs('result/evaluation', exist_ok=True)
     
     # Load or process data
     file_path = "data/Musical_Instruments.jsonl"
     df = load_or_process_data(file_path)
     
-    # Train models
-    print("\nTraining traditional models...")
-    train_traditional_models(df, 'result')
+    # Train and evaluate all models
+    print("\nTraining and evaluating traditional models...")
+    traditional_results, vectorizer = train_traditional_models(df, 'result/evaluation')
     
-    print("\nTraining BERT model...")
-    train_bert(df, 'result')
+    print("\nTraining and evaluating BERT model...")
+    bert_results = train_bert(df, 'result/evaluation')
     
-    print("\nTraining LSTM model...")
-    train_lstm(df, 'result')
+    print("\nTraining and evaluating LSTM model...")
+    lstm_results = train_lstm(df, 'result/evaluation')
     
-    print("\nTraining CNN model...")
-    train_cnn(df, 'result')
+    print("\nTraining and evaluating CNN model...")
+    cnn_results = train_cnn(df, 'result/evaluation')
+    
+    # Combine all results
+    all_results = {
+        **traditional_results,
+        'BERT': bert_results,
+        'LSTM': lstm_results,
+        'CNN': cnn_results
+    }
+    
+    # Generate final comparison table
+    evaluator = ModelEvaluator('result/evaluation')
+    evaluator.generate_latex_table(all_results)
     
     execution_time = time.time() - start_time
     print(f"\nTotal execution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")

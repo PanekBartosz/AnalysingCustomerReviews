@@ -8,4 +8,5 @@ tqdm>=4.62.0
 matplotlib>=3.4.3
 seaborn>=0.11.2
 imbalanced-learn>=0.8.0
-joblib>=1.0.1 
+joblib>=1.0.1
+psutil>=5.8.0 
