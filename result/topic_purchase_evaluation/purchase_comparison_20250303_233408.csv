@@ -1,0 +1,6 @@
+,Logistic_Regression,Random_Forest,Linear_Regression,SVR
+accuracy,0.881942,0.874607,,
+precision,0.882266,0.877986,,
+mse,,,1.489706,0.837707
+mae,,,0.879533,0.595082
+r2,,,-0.1786,0.337237
